@@ -67,3 +67,44 @@ groups:
         The linux user account had been changed on {{ $labels.instance }} in the past 3 days. The file '{{ $labels.name }}' was {{ $labels.nametype }}D. Operators are suggested to check the relevant logs to find out what was changed.
 
           LABELS = {{ $labels }}
+  - alert: TlogRecordingTampered
+    expr: |
+      count by (instance, key, juju_model, juju_model_uuid) (
+        rate({filename=~"/var/log/audit/audit\\.log.*"}
+        | logfmt
+        | type = "SYSCALL"
+        | key =~ "(tlog_recording_tamper|tlog_config_tamper|sshd_dropin_tamper)" [1h])
+      ) > 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: tlog session recording tampered on {{ $labels.instance }}
+      description: |
+        An auditd watch rule fired for key '{{ $labels.key }}' on {{ $labels.instance }}.
+        This indicates a write or attribute change on the tlog recording file, tlog config,
+        or sshd drop-in config. Investigate immediately — recordings may have been altered.
+
+          LABELS = {{ $labels }}
+  - alert: SshdAnomalousExecve
+    expr: |
+      count by (instance, exe, ppid, juju_model, juju_model_uuid) (
+        rate({filename=~"/var/log/audit/audit\\.log.*"}
+        | logfmt
+        | type = "EXECVE"
+        | key = "sshd_execve"
+        | exe = "/usr/sbin/sshd"
+        | a0 =~ "(-f|-p|.*config.*)" [1h])
+      ) > 0
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: Anomalous sshd execution detected on {{ $labels.instance }}
+      description: |
+        sshd was executed with suspicious arguments ({{ $labels.a0 }}) on {{ $labels.instance }}.
+        A second sshd instance launched with custom config could bypass session recording.
+        Note: normal sshd logins also trigger the underlying rule; this alert discriminates
+        on arguments matching -f, -p, or config-path patterns.
+
+          LABELS = {{ $labels }}

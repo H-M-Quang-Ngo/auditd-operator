@@ -1,0 +1,17 @@
+# Tamper detection for tlog session recording.
+# These rules fire on writes/truncations to the recording file and config dirs,
+# and on anomalous sshd execve (second-sshd bypass — alert discriminates in LogQL).
+
+# Recording file: watch for write/attribute changes (truncation, chmod, chown).
+-w /var/log/tlog/sessions.log -p wa -k tlog_recording_tamper
+
+# Writes within the log dir (e.g. creating a replacement file).
+-a always,exit -F dir=/var/log/tlog -F perm=wa -k tlog_recording_tamper
+
+# Config dirs: watch for modifications to tlog and sshd drop-in config.
+-w /etc/tlog/ -p wa -k tlog_config_tamper
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd_dropin_tamper
+
+# sshd execve: raw rule fires on every login; discriminate in the Loki alert
+# (alert only on anomalous parent or args, not every connection).
+-a always,exit -F path=/usr/sbin/sshd -F perm=x -k sshd_execve

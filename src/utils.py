@@ -3,10 +3,12 @@
 
 """The charm utilities module."""
 
+import grp
 import logging
 import os
 import pwd
 import subprocess
+import tempfile
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
@@ -41,6 +43,59 @@ def write_file(path: Path, content: str, owner: str, mode: int = 0o600) -> None:
     os.chmod(path, mode)
     u = pwd.getpwnam(owner)
     os.chown(path, uid=u.pw_uid, gid=u.pw_gid)
+
+
+def write_file_with_group(
+    path: Path, content: str, owner: str, group: str, mode: int = 0o600
+) -> None:
+    """Atomically write a file with a distinct owner and group.
+
+    Uses os.replace for atomicity: snippet is never partially written.
+
+    Args:
+        path: Destination path.
+        content: Text to write.
+        owner: Owner username.
+        group: Group name (may differ from owner's primary group).
+        mode: Access permission mask (default 0o600).
+
+    """
+    uid = pwd.getpwnam(owner).pw_uid
+    gid = grp.getgrnam(group).gr_gid
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".tmp.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(tmp_path, mode)
+        os.chown(tmp_path, uid=uid, gid=gid)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def make_dir(path: Path, owner: str, group: str, mode: int) -> None:
+    """Ensure a directory exists with the given owner, group and mode.
+
+    Idempotent: no-op if the directory already has correct attributes.
+
+    Args:
+        path: Directory path.
+        owner: Owner username.
+        group: Group name (may differ from owner's primary group).
+        mode: Permission bits (e.g. 0o2750 for setgid dir).
+
+    """
+    uid = pwd.getpwnam(owner).pw_uid
+    gid = grp.getgrnam(group).gr_gid
+    path.mkdir(parents=True, exist_ok=True)
+    os.chown(path, uid=uid, gid=gid)
+    os.chmod(path, mode)
 
 
 def render_jinja2_template(context: dict, template_name: str, template_file_path: str) -> str:

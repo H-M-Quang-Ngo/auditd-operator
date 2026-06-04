@@ -33,6 +33,17 @@ config:
       description: |
         The maximum file size in megabytes. When this limit is reached, it will trigger a
         'ROTATE' action to rotate the log file.
+    session_recording_groups:
+      type: string
+      default: ""
+      description: |
+        Comma-separated list of Unix group names whose SSH sessions will be recorded by tlog.
+        Members of these groups are matched via sshd Match Group (OR-semantics: primary or
+        supplementary group membership). Set to empty (default) disables recording.
+
+        Groups in this list match any user whose *primary or supplementary* group is listed
+        - including groups like 'sudo' or 'adm' which cover far more users than intended.
+        Block on system groups (root, sudo, adm, users, nogroup, daemon).
 
 provides:
   cos-agent:

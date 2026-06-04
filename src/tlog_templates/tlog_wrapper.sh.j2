@@ -1,0 +1,22 @@
+#!/bin/sh
+# Managed by auditd-operator charm. Do not edit manually.
+# tlog-rec-session (setuid tlog) opens the log sink with privilege;
+# the recorded shell runs unprivileged as the connecting user.
+user_shell=$(getent passwd "$(id -un)" | cut -d: -f7)
+[ -n "$user_shell" ] || user_shell=/bin/sh
+
+case "$SSH_ORIGINAL_COMMAND" in
+  # Binary file-transfer protocols: tlog cannot record them and its pty layer corrupts framing.
+  # Pass through to the user's real shell unrecorded (covered by auditd path-watch rules).
+  "scp -"*|"rsync --server"*|"/usr/lib/openssh/sftp-server"*|"internal-sftp"*)
+    exec "$user_shell" -c "$SSH_ORIGINAL_COMMAND"
+    ;;
+  "")
+    # Interactive login: record an interactive shell.
+    exec /usr/bin/tlog-rec-session
+    ;;
+  *)
+    # Remote command (ssh host "cmd"): allocate pty and record.
+    exec /usr/bin/tlog-rec-session -c "$SSH_ORIGINAL_COMMAND"
+    ;;
+esac

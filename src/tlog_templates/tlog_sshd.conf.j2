@@ -1,0 +1,5 @@
+# Managed by auditd-operator charm. Do not edit manually.
+# Record SSH sessions for members of the configured groups.
+# Match Group uses OR-semantics: matches primary OR any supplementary group.
+Match Group {{ session_recording_groups }}
+    ForceCommand /usr/local/bin/tlog-wrapper

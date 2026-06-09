@@ -153,7 +153,7 @@ class AuditdService:
         return systemd.service_running(self.name)
 
     def ensure_audit_rules(self) -> None:
-        """Write rule files and reload if any changed (C6).
+        """Write rule files and reload if any changed.
 
         Idempotent: rules already matching what is in AUDIT_RULE_PATH produce no reload.
         Called from the configure path so new rules load on a running unit, not only at

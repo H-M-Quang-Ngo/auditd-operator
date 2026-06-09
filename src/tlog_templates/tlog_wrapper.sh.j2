@@ -1,6 +1,6 @@
 #!/bin/sh
 # Managed by auditd-operator charm. Do not edit manually.
-# tlog-rec-session (setuid tlog) opens the log sink with privilege;
+# tlog-rec-session (setuid _tlog) opens the log sink with privilege;
 # the recorded shell runs unprivileged as the connecting user.
 user_shell=$(getent passwd "$(id -un)" | cut -d: -f7)
 [ -n "$user_shell" ] || user_shell=/bin/sh

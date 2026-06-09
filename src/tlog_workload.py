@@ -48,7 +48,7 @@ _TLOG_LOGROTATE_CONTENT = f"""\
     compress
     delaycompress
     notifempty
-    create 0640 tlog adm
+    create 0640 _tlog adm
     prerotate
         chattr -a {TLOG_LOG_FILE} 2>/dev/null || true
     endscript
@@ -129,83 +129,64 @@ class TlogService:
             write_file_with_group(
                 self._log_file, "", TLOG_LOG_FILE_OWNER, TLOG_LOG_FILE_GROUP, TLOG_LOG_FILE_MODE
             )
+        self._ensure_append_only()
+
+    def _ensure_append_only(self) -> None:
+        """Set append-only (chattr +a) on sessions.log as tamper hardening.
+
+        Runs every reconcile so it self-heals on already-created files.
+
+        A failure is logged, not raised to not block the recording,
+        the auditd watch rule on sessions.log is the detection backstop.
+
+        """
+        result = subprocess.run(
+            ["chattr", "+a", str(self._log_file)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Could not set append-only on %s (recording continues; auditd watch "
+                "still detects tampering): %s",
+                self._log_file,
+                result.stderr.strip(),
+            )
 
     def _ensure_privileged_recorder(self) -> None:
         """Reproduce the upstream setuid configuration.
 
-        Ubuntu installs tlog-rec-session as a plain root:root executable with
-        no setuid bit and creates no `tlog` system user. Upstream ships the binary
-        mode 6755 owned tlog:tlog
-        (https://github.com/Scribery/tlog/blob/006f58ab1af0cb55247f1baf4fcfba08e9870b16/tlog.spec#L124)
+        The Ubuntu tlog package already creates the `_tlog` system user/group but it ships
+        tlog-rec-session as a plain root:root executable. Upstream ships the same binary mode
+        6755 owned by tlog user:
+        (https://github.com/Scribery/tlog/blob/006f58ab1af0cb55247f1baf4fcfba08e9870b16/tlog.spec#L124).
 
         The file writer relies on that setuid privilege-drop: the binary saves the
-        privileged tlog euid/egid, drops to the connecting user for the recorded
-        shell, then opens the shared sessions.log with the saved tlog privilege.
-        Without it the unprivileged recorded user cannot write the tamper-protected
-        (tlog:adm 0640) log and recording fails with EACCES.
+        privileged `_tlog` euid/egid, drops to the connecting user for the recorded
+        shell, then opens the shared sessions.log and the /run/tlog session lock
+        with the saved `_tlog` privilege. Without it the unprivileged recorded user
+        cannot write the tamper-protected (_tlog:adm 0640) log and recording fails
+        with EACCES.
 
-        Creates the tlog system group+user if absent and restores the setuid
-        ownership/mode on the binary. Runs on every reconcile because a package
+        Sets the binary to `_tlog:_tlog` mode 6755. Runs on every reconcile because a package
         upgrade reverts the binary to root:root non-setuid.
 
         Raises:
-            TlogServiceError: user/group creation or binary mode change failed.
+            TlogServiceError: the `_tlog` principal is missing or the binary mode
+                change failed.
 
         """
         try:
-            self._ensure_system_group(TLOG_SYSTEM_GROUP)
-            self._ensure_system_user(TLOG_SYSTEM_USER, TLOG_SYSTEM_GROUP)
             uid = pwd.getpwnam(TLOG_SYSTEM_USER).pw_uid
             gid = grp.getgrnam(TLOG_SYSTEM_GROUP).gr_gid
             os.chown(self._tlog_bin, uid, gid)
             os.chmod(self._tlog_bin, TLOG_BIN_MODE)
-        except (KeyError, OSError, subprocess.SubprocessError) as exc:
+        except (KeyError, OSError) as exc:
             raise TlogServiceError(
-                f"Failed to set up the privileged tlog recorder: {exc}"
+                f"Failed to set up the privileged tlog recorder "
+                f"(Check tlog installation so '{TLOG_SYSTEM_USER}' exists?): {exc}"
             ) from exc
-
-    @staticmethod
-    def _ensure_system_group(name: str) -> None:
-        """Create a system group if it does not already exist.
-
-        Args:
-            name (str): the group name to ensure exists.
-
-        """
-        try:
-            grp.getgrnam(name)
-            return
-        except KeyError:
-            pass
-        subprocess.run(["groupadd", "--system", name], check=True)
-
-    @staticmethod
-    def _ensure_system_user(name: str, group: str) -> None:
-        """Create a no-login system user in the given group if it does not exist.
-
-        Args:
-            name (str): the username to ensure exists.
-            group (str): the group name for the user.
-
-        """
-        try:
-            pwd.getpwnam(name)
-            return
-        except KeyError:
-            pass
-        subprocess.run(
-            [
-                "useradd",
-                "--system",
-                "--gid",
-                group,
-                "--no-create-home",
-                "--shell",
-                "/usr/sbin/nologin",
-                name,
-            ],
-            check=True,
-        )
 
     def configure(self, groups: str) -> None:
         """Enable or disable tlog recording.

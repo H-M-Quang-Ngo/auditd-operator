@@ -26,21 +26,17 @@ def _mock_file(content: str = "") -> MagicMock:
 
 
 @patch("tlog_workload.apt.add_package")
-@patch(
-    "tlog_workload.subprocess.run",
-    return_value=MagicMock(returncode=0, stdout="Candidate: 2.0-1\n"),
-)
-def test_install_success(mock_run, mock_add, svc):
+def test_install_success(mock_add, svc):
     svc.install()
-    mock_add.assert_called_once_with(package_names="tlog", update_cache=False)
+    mock_add.assert_called_once_with(package_names="tlog")
 
 
 @patch(
-    "tlog_workload.subprocess.run",
-    return_value=MagicMock(returncode=0, stdout="Candidate: (none)\n"),
+    "tlog_workload.apt.add_package",
+    side_effect=apt.PackageError("Failed to install packages: tlog"),
 )
-def test_install_no_candidate_raises(mock_run, svc):
-    with pytest.raises(TlogServiceError, match="not available"):
+def test_install_failure_raises_with_universe_hint(mock_add, svc):
+    with pytest.raises(TlogServiceError, match="universe"):
         svc.install()
 
 
@@ -74,21 +70,42 @@ def test_remove_when_not_installed(mock_remove, _, svc):
     mock_remove.assert_not_called()
 
 
+@patch.object(TlogService, "_reload_audit_rules")
 @patch.object(TlogService, "reload_sshd")
-def test_configure_empty_no_snippet_no_reload(mock_reload, svc, tmp_path):
+def test_configure_empty_no_snippet_no_reload(mock_reload, mock_reload_rules, svc, tmp_path):
     svc._snippet_path = tmp_path / "99-tlog-recording.conf"
+    svc._audit_rules_path = tmp_path / "tlog.rules"
     svc.configure("")
     mock_reload.assert_not_called()
+    mock_reload_rules.assert_not_called()
 
 
+@patch.object(TlogService, "_reload_audit_rules")
 @patch.object(TlogService, "reload_sshd")
-def test_configure_empty_removes_snippet_and_reloads(mock_reload, svc, tmp_path):
+def test_configure_empty_removes_snippet_and_reloads(mock_reload, _reload_rules, svc, tmp_path):
     snippet = tmp_path / "99-tlog-recording.conf"
     snippet.write_text("old snippet")
     svc._snippet_path = snippet
+    svc._audit_rules_path = tmp_path / "tlog.rules"
     svc.configure("")
     assert not snippet.exists()
     mock_reload.assert_called_once()
+
+
+@patch.object(TlogService, "_reload_audit_rules")
+@patch.object(TlogService, "reload_sshd")
+def test_configure_empty_removes_audit_rules_and_reloads(
+    mock_reload_sshd, mock_reload_rules, svc, tmp_path
+):
+    """Disabling removes the tamper rules installed by the enable path."""
+    svc._snippet_path = tmp_path / "99-tlog-recording.conf"
+    rules = tmp_path / "tlog.rules"
+    rules.write_text("-w /var/log/tlog/sessions.log -p wa -k tlog_recording_tamper\n")
+    svc._audit_rules_path = rules
+    svc.configure("")
+    assert not rules.exists()
+    mock_reload_rules.assert_called_once()
+    mock_reload_sshd.assert_not_called()
 
 
 @patch.object(TlogService, "_ensure_privileged_recorder")
@@ -118,10 +135,12 @@ def test_configure_enable_ordering(
     with (
         patch("tlog_workload.render_jinja2_template", return_value="new-snippet"),
         patch("tlog_workload.write_file"),
+        patch.object(TlogService, "_write_logrotate") as mock_logrotate,
+        patch.object(TlogService, "_ensure_audit_rules") as mock_rules,
     ):
         svc.configure("warthogs")
 
-    call_order = [mock_ensure, mock_conf, mock_wrapper]
+    call_order = [mock_ensure, mock_conf, mock_wrapper, mock_logrotate, mock_rules]
     for m in call_order:
         m.assert_called_once()
 
@@ -151,14 +170,16 @@ def test_configure_snippet_not_written_when_wrapper_fails(
 
 @patch.object(TlogService, "_ensure_privileged_recorder")
 @patch.object(TlogService, "reload_sshd")
+@patch.object(TlogService, "_ensure_audit_rules")
+@patch.object(TlogService, "_write_logrotate")
 @patch.object(TlogService, "_write_wrapper_atomic")
 @patch.object(TlogService, "_write_tlog_conf")
 @patch.object(TlogService, "ensure_log_dir")
 @patch.object(TlogService, "is_installed", return_value=True)
 def test_configure_sshd_t_failure_reverts_snippet(
-    _installed, _ensure, _conf, _wrapper, mock_reload, _priv, svc, tmp_path
+    _installed, _ensure, _conf, _wrapper, _logrotate, _rules, mock_reload, _priv, svc, tmp_path
 ):
-    """Sshd -t failure must remove the written snippet."""
+    """Sshd -t failure with no previous snippet must remove the written snippet."""
     snippet = tmp_path / "99-tlog-recording.conf"
     svc._snippet_path = snippet
 
@@ -170,7 +191,7 @@ def test_configure_sshd_t_failure_reverts_snippet(
         patch("tlog_workload.render_jinja2_template", return_value="new-snippet"),
         patch(
             "tlog_workload.write_file",
-            side_effect=lambda path, *a, **kw: snippet.write_text("x"),
+            side_effect=lambda path, content, *a, **kw: snippet.write_text(content),
         ),
     ):
         with pytest.raises(TlogServiceReloadError):
@@ -178,6 +199,86 @@ def test_configure_sshd_t_failure_reverts_snippet(
 
     assert not snippet.exists(), "snippet must be reverted on sshd -t failure"
     mock_reload.assert_not_called()
+
+
+@patch.object(TlogService, "_ensure_privileged_recorder")
+@patch.object(TlogService, "reload_sshd")
+@patch.object(TlogService, "_ensure_audit_rules")
+@patch.object(TlogService, "_write_logrotate")
+@patch.object(TlogService, "_write_wrapper_atomic")
+@patch.object(TlogService, "_write_tlog_conf")
+@patch.object(TlogService, "ensure_log_dir")
+@patch.object(TlogService, "is_installed", return_value=True)
+def test_configure_sshd_t_failure_restores_previous_snippet(
+    _installed, _ensure, _conf, _wrapper, _logrotate, _rules, mock_reload, _priv, svc, tmp_path
+):
+    """A failed validation must restore the previous working snippet, not delete it."""
+    snippet = tmp_path / "99-tlog-recording.conf"
+    snippet.write_text("Match Group oldgroup\n")
+    svc._snippet_path = snippet
+
+    with (
+        patch(
+            "tlog_workload.subprocess.run",
+            return_value=MagicMock(returncode=1, stderr="bad config"),
+        ),
+        patch("tlog_workload.render_jinja2_template", return_value="Match Group newgroup\n"),
+        patch(
+            "tlog_workload.write_file",
+            side_effect=lambda path, content, *a, **kw: snippet.write_text(content),
+        ),
+    ):
+        with pytest.raises(TlogServiceReloadError):
+            svc.configure("newgroup")
+
+    assert snippet.read_text() == "Match Group oldgroup\n"
+    mock_reload.assert_not_called()
+
+
+@patch.object(TlogService, "_ensure_privileged_recorder")
+@patch.object(
+    TlogService, "reload_sshd", side_effect=TlogServiceReloadError("Failed to reload ssh.")
+)
+@patch.object(TlogService, "validate_sshd")
+@patch.object(TlogService, "_ensure_audit_rules")
+@patch.object(TlogService, "_write_logrotate")
+@patch.object(TlogService, "_write_wrapper_atomic")
+@patch.object(TlogService, "_write_tlog_conf")
+@patch.object(TlogService, "ensure_log_dir")
+@patch.object(TlogService, "is_installed", return_value=True)
+def test_configure_reload_failure_restores_previous_snippet(
+    _installed,
+    _ensure,
+    _conf,
+    _wrapper,
+    _logrotate,
+    _rules,
+    _validate,
+    _reload,
+    _priv,
+    svc,
+    tmp_path,
+):
+    """A failed reload must restore the previous snippet.
+
+    The next reconcile then sees a content difference and retries the reload
+    instead of skipping it as unchanged.
+    """
+    snippet = tmp_path / "99-tlog-recording.conf"
+    snippet.write_text("Match Group oldgroup\n")
+    svc._snippet_path = snippet
+
+    with (
+        patch("tlog_workload.render_jinja2_template", return_value="Match Group newgroup\n"),
+        patch(
+            "tlog_workload.write_file",
+            side_effect=lambda path, content, *a, **kw: snippet.write_text(content),
+        ),
+    ):
+        with pytest.raises(TlogServiceReloadError):
+            svc.configure("newgroup")
+
+    assert snippet.read_text() == "Match Group oldgroup\n"
 
 
 @patch.object(TlogService, "_ensure_privileged_recorder")
@@ -204,6 +305,8 @@ def test_configure_no_reload_when_snippet_unchanged(
         patch.object(TlogService, "_write_wrapper_atomic"),
         patch.object(TlogService, "ensure_log_dir"),
         patch.object(TlogService, "_write_tlog_conf"),
+        patch.object(TlogService, "_write_logrotate"),
+        patch.object(TlogService, "_ensure_audit_rules"),
     ):
         mock_render.return_value = expected_snippet
         svc.configure(groups)
@@ -219,20 +322,20 @@ def test_validate_sshd_success(mock_run, svc, tmp_path):
     mock_run.assert_called_once()
 
 
-def test_validate_sshd_failure_removes_snippet(svc, tmp_path):
-    """Sshd -t failure removes the snippet."""
+def test_validate_sshd_failure_raises_and_keeps_snippet(svc, tmp_path):
+    """validate_sshd only validates; reverting is the caller's responsibility."""
     snippet = tmp_path / "99-tlog-recording.conf"
-    snippet.write_text("bad config")
+    snippet.write_text("pending config")
     svc._snippet_path = snippet
 
     with patch(
         "tlog_workload.subprocess.run",
         return_value=MagicMock(returncode=1, stderr="bad config error"),
     ):
-        with pytest.raises(TlogServiceReloadError):
+        with pytest.raises(TlogServiceReloadError, match="validation failed"):
             svc.validate_sshd()
 
-    assert not snippet.exists()
+    assert snippet.read_text() == "pending config"
 
 
 @patch("tlog_workload.systemd.service_reload")
@@ -263,12 +366,6 @@ def test_write_logrotate_no_write_when_unchanged(mock_write, svc, tmp_path):
     mock_write.assert_not_called()
 
 
-@patch("tlog_workload.subprocess.run", side_effect=FileNotFoundError)
-def test_install_apt_cache_not_found(_, svc):
-    with pytest.raises(TlogServiceError, match="apt-cache not found"):
-        svc.install()
-
-
 @patch.object(TlogService, "_ensure_append_only")
 @patch("tlog_workload.write_file_with_group")
 @patch("tlog_workload.make_dir")
@@ -283,20 +380,30 @@ def test_ensure_log_dir_creates_file_when_absent(
     mock_attr.assert_called_once()
 
 
+@patch("tlog_workload.os.chmod")
+@patch("tlog_workload.os.chown")
+@patch("tlog_workload.grp.getgrnam", return_value=MagicMock(gr_gid=4))
+@patch("tlog_workload.pwd.getpwnam", return_value=MagicMock(pw_uid=999))
 @patch.object(TlogService, "_ensure_append_only")
 @patch("tlog_workload.write_file_with_group")
 @patch("tlog_workload.make_dir")
-def test_ensure_log_dir_no_write_when_file_exists(
-    mock_make_dir, mock_write, mock_attr, svc, tmp_path
+def test_ensure_log_dir_heals_existing_file_without_rewrite(
+    mock_make_dir, mock_write, mock_attr, mock_pwd, mock_grp, mock_chown, mock_chmod, svc, tmp_path
 ):
+    """An existing file gets ownership/mode healed but its content is never touched."""
     log_dir = tmp_path / "tlog"
     log_dir.mkdir()
     log_file = log_dir / "sessions.log"
-    log_file.write_text("")
+    log_file.write_text("existing recording data")
     svc._log_dir = log_dir
     svc._log_file = log_file
     svc.ensure_log_dir()
     mock_write.assert_not_called()
+    mock_pwd.assert_called_once_with("_tlog")
+    mock_grp.assert_called_once_with("adm")
+    mock_chown.assert_called_once_with(log_file, 999, 4)
+    mock_chmod.assert_called_once_with(log_file, 0o640)
+    assert log_file.read_text() == "existing recording data"
     mock_attr.assert_called_once()
 
 
@@ -327,6 +434,7 @@ def test_ensure_append_only_warns_and_does_not_raise(mock_run, svc, tmp_path):
 
 @patch.object(TlogService, "_ensure_privileged_recorder")
 @patch.object(TlogService, "_write_sshd_snippet")
+@patch.object(TlogService, "_ensure_audit_rules")
 @patch.object(TlogService, "_write_logrotate")
 @patch.object(TlogService, "_write_wrapper_atomic")
 @patch.object(TlogService, "_write_tlog_conf")
@@ -334,10 +442,57 @@ def test_ensure_append_only_warns_and_does_not_raise(mock_run, svc, tmp_path):
 @patch.object(TlogService, "install")
 @patch.object(TlogService, "is_installed", return_value=False)
 def test_configure_installs_when_not_installed(
-    _installed, mock_install, _ensure, _conf, _wrapper, _logrotate, _snippet, _priv, svc
+    _installed, mock_install, _ensure, _conf, _wrapper, _logrotate, _rules, _snippet, _priv, svc
 ):
     svc.configure("warthogs")
     mock_install.assert_called_once()
+
+
+@patch.object(TlogService, "_reload_audit_rules")
+@patch("tlog_workload.write_file")
+def test_ensure_audit_rules_writes_and_reloads_on_change(mock_write, mock_reload, svc, tmp_path):
+    source = tmp_path / "tlog.rules"
+    source.write_text("-w /var/log/tlog/sessions.log -p wa -k tlog_recording_tamper\n")
+    svc._audit_rules_source = source
+    svc._audit_rules_path = tmp_path / "dest-tlog.rules"
+    svc._ensure_audit_rules()
+    mock_write.assert_called_once()
+    mock_reload.assert_called_once()
+
+
+@patch.object(TlogService, "_reload_audit_rules")
+@patch("tlog_workload.write_file")
+def test_ensure_audit_rules_no_reload_when_unchanged(mock_write, mock_reload, svc, tmp_path):
+    content = "-w /var/log/tlog/sessions.log -p wa -k tlog_recording_tamper\n"
+    source = tmp_path / "tlog.rules"
+    source.write_text(content)
+    dest = tmp_path / "dest-tlog.rules"
+    dest.write_text(content)
+    svc._audit_rules_source = source
+    svc._audit_rules_path = dest
+    svc._ensure_audit_rules()
+    mock_write.assert_not_called()
+    mock_reload.assert_not_called()
+
+
+@patch("tlog_workload.subprocess.run", return_value=MagicMock(returncode=0, stderr=""))
+def test_reload_audit_rules_invokes_augenrules(mock_run, svc):
+    svc._reload_audit_rules()
+    mock_run.assert_called_once_with(
+        ["augenrules", "--load"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@patch(
+    "tlog_workload.subprocess.run",
+    return_value=MagicMock(returncode=1, stderr="augenrules failure"),
+)
+def test_reload_audit_rules_failure_does_not_raise(mock_run, svc):
+    """Recording must keep working when rule loading fails; failure is logged."""
+    svc._reload_audit_rules()
 
 
 @patch("tlog_workload.write_file")

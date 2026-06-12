@@ -1,6 +1,7 @@
 from subprocess import CalledProcessError
 from unittest.mock import MagicMock, patch
 
+import pydantic
 import pytest
 from charms.operator_libs_linux.v0 import apt
 from charms.operator_libs_linux.v1 import systemd
@@ -10,6 +11,89 @@ from workloads import (
     AuditdService,
     AuditdServiceRestartError,
 )
+
+
+def test_session_recording_groups_empty_default():
+    config = AuditdConfig()
+    assert config.session_recording_groups == ""
+
+
+def test_session_recording_groups_empty_string():
+    config = AuditdConfig(session_recording_groups="")
+    assert config.session_recording_groups == ""
+
+
+def test_session_recording_groups_single_group():
+    config = AuditdConfig(session_recording_groups="warthogs")
+    assert config.session_recording_groups == "warthogs"
+
+
+def test_session_recording_groups_multi_group():
+    config = AuditdConfig(session_recording_groups="warthogs,bootstack-squad")
+    assert config.session_recording_groups == "warthogs,bootstack-squad"
+
+
+def test_session_recording_groups_whitespace_trimmed():
+    config = AuditdConfig(session_recording_groups=" warthogs , bootstack-squad ")
+    assert config.session_recording_groups == "warthogs,bootstack-squad"
+
+
+def test_session_recording_groups_comma_join_not_space():
+    """Assert the stored shape is exactly comma-separated, no spaces."""
+    config = AuditdConfig(session_recording_groups="a, b")
+    assert config.session_recording_groups == "a,b"
+    assert " " not in config.session_recording_groups
+
+
+def test_session_recording_groups_underscore_and_hyphen():
+    config = AuditdConfig(session_recording_groups="my_group,my-group")
+    assert config.session_recording_groups == "my_group,my-group"
+
+
+def test_session_recording_groups_rejected_quote():
+    with pytest.raises(ValueError, match="Invalid group name"):
+        AuditdConfig(session_recording_groups="warthog's")
+
+
+def test_session_recording_groups_rejected_space_in_name():
+    with pytest.raises(ValueError, match="Invalid group name"):
+        AuditdConfig(session_recording_groups="my group")
+
+
+def test_session_recording_groups_rejected_semicolon():
+    with pytest.raises(ValueError, match="Invalid group name"):
+        AuditdConfig(session_recording_groups="group;evil")
+
+
+def test_session_recording_groups_rejected_newline():
+    with pytest.raises(ValueError, match="Invalid group name"):
+        AuditdConfig(session_recording_groups="group\nevil")
+
+
+def test_session_recording_groups_rejected_uppercase():
+    with pytest.raises(ValueError, match="Invalid group name"):
+        AuditdConfig(session_recording_groups="MyGroup")
+
+
+def test_session_recording_groups_rejected_denylist_sudo():
+    with pytest.raises(ValueError, match="dangerous-group denylist"):
+        AuditdConfig(session_recording_groups="sudo")
+
+
+def test_session_recording_groups_rejected_denylist_root():
+    with pytest.raises(ValueError, match="dangerous-group denylist"):
+        AuditdConfig(session_recording_groups="root")
+
+
+def test_session_recording_groups_rejected_denylist_adm():
+    with pytest.raises(ValueError, match="dangerous-group denylist"):
+        AuditdConfig(session_recording_groups="adm")
+
+
+def test_session_recording_groups_valid_raises_pydantic_validation_error():
+    """Ensure pydantic.ValidationError is raised."""
+    with pytest.raises(pydantic.ValidationError):
+        AuditdConfig(session_recording_groups="INVALID")
 
 
 def test_auditd_config_valid_num_logs():
@@ -128,3 +212,53 @@ def test_merge_audit_rules_failure(_):
     service = AuditdService()
     with pytest.raises(CalledProcessError):
         service._merge_audit_rules()
+
+
+def test_ensure_audit_rules_reloads_on_change(tmp_path):
+    """Changed rule content triggers a write and augenrules reload."""
+    service = AuditdService()
+    service.rule_path = tmp_path / "rules.d"
+    service.rule_path.mkdir()
+
+    src_rules = tmp_path / "src"
+    src_rules.mkdir()
+    rule = src_rules / "tlog.rules"
+    rule.write_text("new rule content")
+
+    with (
+        patch.object(service, "_merge_audit_rules") as mock_merge,
+        patch("workloads.Path.glob", return_value=[rule]),
+        patch("workloads.AUDIT_RULE_PATH", str(src_rules)),
+        patch("workloads.write_file") as mock_write,
+    ):
+        service.ensure_audit_rules()
+
+    mock_write.assert_called_once()
+    mock_merge.assert_called_once()
+
+
+def test_ensure_audit_rules_no_reload_when_unchanged(tmp_path):
+    """Unchanged rule content produces no write and no reload."""
+    service = AuditdService()
+    service.rule_path = tmp_path / "rules.d"
+    service.rule_path.mkdir()
+
+    existing_content = "existing rule\n"
+    rule_dest = service.rule_path / "tlog.rules"
+    rule_dest.write_text(existing_content)
+
+    src_rules = tmp_path / "src"
+    src_rules.mkdir()
+    rule = src_rules / "tlog.rules"
+    rule.write_text(existing_content)
+
+    with (
+        patch.object(service, "_merge_audit_rules") as mock_merge,
+        patch("workloads.Path.glob", return_value=[rule]),
+        patch("workloads.AUDIT_RULE_PATH", str(src_rules)),
+        patch("workloads.write_file") as mock_write,
+    ):
+        service.ensure_audit_rules()
+
+    mock_write.assert_not_called()
+    mock_merge.assert_not_called()

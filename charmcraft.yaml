@@ -41,9 +41,8 @@ config:
         Members of these groups are matched via sshd Match Group (OR-semantics: primary or
         supplementary group membership). Set to empty (default) disables recording.
 
-        Groups in this list match any user whose *primary or supplementary* group is listed
-        - including groups like 'sudo' or 'adm' which cover far more users than intended.
-        Block on system groups (root, sudo, adm, users, nogroup, daemon).
+        Broad groups would record far more users than intended, so the system groups
+        root, sudo, adm, users, nogroup and daemon are rejected.
 
 provides:
   cos-agent:

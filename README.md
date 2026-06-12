@@ -37,19 +37,28 @@ juju config auditd session_recording_groups="warthogs,bootstack-squad"
 
 - **Root can evade recording.** Root-equivalent users can bypass the `ForceCommand` wrapper
   (e.g. by running a second sshd with custom config). This is covered by auditd
-  tamper-detection rules that ship with the charm.
-- **Recordings contain secrets.** Session output echoes commands, passwords typed at prompts,
-  and full program output (e.g. `cat admin.conf`, kubeconfigs, tokens). Before enabling, ensure
-  that Loki has appropriate RBAC and data-retention policies so that tlog records are accessible
-  only to authorised operators and are retained no longer than required.
+  tamper-detection rules installed alongside session recording.
+- **Recordings contain secrets.** Recording captures everything *displayed* in the terminal:
+  commands as typed (echoed by the shell) and full program output (e.g. `cat admin.conf`,
+  kubeconfigs, tokens). Passwords entered at non-echoing prompts (sudo, SSH) are not captured -
+  terminal input recording is disabled. Before enabling, ensure that Loki has appropriate RBAC
+  and data-retention policies so that tlog records are accessible only to authorised operators
+  and are retained no longer than required.
 - **File transfers are not recorded.** `scp`, `rsync`, and sftp sessions are passed through
   unrecorded (the tlog pty layer would corrupt binary framing). They are still covered by auditd
   path-watch rules.
 
 ### Replay
 
+All sessions share one file; each recording is identified by its `rec` field. List the
+recordings, then replay one:
+
 ```
-tlog-play -r file -M /var/log/tlog/sessions.log
+# list recordings
+sudo jq -r 'select(.id==1) | "\(.rec)  \(.user)  \(.time | todate)"' /var/log/tlog/sessions.log
+
+# replay a specific recording
+sudo tlog-play -r file -i /var/log/tlog/sessions.log -m "<rec-id>"
 ```
 
 [2]: https://github.com/Scribery/tlog

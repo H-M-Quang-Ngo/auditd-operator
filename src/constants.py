@@ -34,6 +34,10 @@ TLOG_SSHD_SNIPPET = "/etc/ssh/sshd_config.d/99-tlog-recording.conf"
 TLOG_BIN = "/usr/bin/tlog-rec-session"
 TLOG_LOGROTATE_FILE = "/etc/logrotate.d/tlog"
 
+# Tamper-detection audit rules for session recording
+TLOG_AUDIT_RULES_SOURCE = "./src/tlog_templates/tlog.rules"
+TLOG_AUDIT_RULES_FILE = "/etc/audit/rules.d/tlog.rules"
+
 # Privileged-recorder setup for tlog-rec-session.
 # The Ubuntu tlog package already creates the `_tlog` system user/group
 # but it ships the binary non-setuid root:root.

@@ -1,6 +1,10 @@
 # Tamper detection for tlog session recording.
 # These rules fire on writes/truncations to the recording file and config dirs,
 # and on anomalous sshd execve (second-sshd bypass).
+#
+# Installed/removed together with session recording: the watched paths only
+# exist while recording is configured, so the rules below are only active when
+# recording is active.
 
 # Recording file: watch for write/attribute changes (truncation, chmod, chown).
 -w /var/log/tlog/sessions.log -p wa -k tlog_recording_tamper
@@ -12,6 +16,8 @@
 -w /etc/tlog/ -p wa -k tlog_config_tamper
 -w /etc/ssh/sshd_config.d/ -p wa -k sshd_dropin_tamper
 
-# sshd execve: raw rule fires on every login
-# (alert only on anomalous parent or args, not every connection).
--a always,exit -F path=/usr/sbin/sshd -F perm=x -k sshd_execve
+# sshd execve: legitimate sshd executions (boot, systemd restart, per-connection
+# re-exec) happen before pam_loginuid assigns a login uid, so their auid is unset.
+# Filtering on auid leaves only sshd launched from a logged-in session -- the
+# second-sshd recording bypass this rule exists to catch.
+-a always,exit -F path=/usr/sbin/sshd -F perm=x -F auid!=unset -k sshd_execve

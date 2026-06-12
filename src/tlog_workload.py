@@ -14,6 +14,8 @@ from charms.operator_libs_linux.v0 import apt
 from charms.operator_libs_linux.v1 import systemd
 
 from constants import (
+    TLOG_AUDIT_RULES_FILE,
+    TLOG_AUDIT_RULES_SOURCE,
     TLOG_BIN,
     TLOG_BIN_MODE,
     TLOG_CONF_FILE,
@@ -35,7 +37,7 @@ from constants import (
     TLOG_WRAPPER_FILE,
     TLOG_WRAPPER_TEMPLATE,
 )
-from utils import make_dir, render_jinja2_template, write_file, write_file_with_group
+from utils import make_dir, read_file, render_jinja2_template, write_file, write_file_with_group
 
 # logrotate config for /var/log/tlog/sessions.log.
 # prerotate/postrotate chattr dance: +a forbids rename+truncate so default rotate fails.
@@ -82,32 +84,23 @@ class TlogService:
     _log_file = Path(TLOG_LOG_FILE)
     _tlog_bin = Path(TLOG_BIN)
     _logrotate_path = Path(TLOG_LOGROTATE_FILE)
+    _audit_rules_source = Path(TLOG_AUDIT_RULES_SOURCE)
+    _audit_rules_path = Path(TLOG_AUDIT_RULES_FILE)
 
     def install(self) -> None:
-        """Install tlog package; raise TlogServiceError if unavailable.
+        """Install the tlog package; raise TlogServiceError on failure.
 
         Raises:
-            TlogServiceError: if the tlog package is not available in apt cache
-            or apt-cache is not found.
+            TlogServiceError: installation failed.
 
         """
         try:
-            result = subprocess.run(
-                ["apt-cache", "policy", self.pkg],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if "Candidate: (none)" in result.stdout or not result.stdout.strip():
-                raise TlogServiceError(
-                    f"Package '{self.pkg}' is not available. "
-                    "Ensure the 'universe' apt pocket is enabled."
-                )
-        except FileNotFoundError as exc:
+            apt.add_package(package_names=self.pkg)
+        except apt.PackageError as exc:
             raise TlogServiceError(
-                "apt-cache not found; cannot verify tlog availability."
+                f"Failed to install '{self.pkg}'. If the package was not found, "
+                "ensure the 'universe' apt pocket is enabled."
             ) from exc
-        apt.add_package(package_names=self.pkg, update_cache=False)
 
     def remove(self) -> None:
         """Remove tlog package."""
@@ -123,12 +116,22 @@ class TlogService:
         return True
 
     def ensure_log_dir(self) -> None:
-        """Ensure /var/log/tlog/ exists with privileged ownership."""
+        """Ensure /var/log/tlog/ and the log file exist with privileged ownership.
+
+        Ownership/permissions are re-enforced on every reconcile so a drifted
+        file is healed and recording does not fail with EACCES.
+
+        """
         make_dir(self._log_dir, TLOG_LOG_DIR_OWNER, TLOG_LOG_DIR_GROUP, TLOG_LOG_DIR_MODE)
         if not self._log_file.exists():
             write_file_with_group(
                 self._log_file, "", TLOG_LOG_FILE_OWNER, TLOG_LOG_FILE_GROUP, TLOG_LOG_FILE_MODE
             )
+        else:
+            uid = pwd.getpwnam(TLOG_LOG_FILE_OWNER).pw_uid
+            gid = grp.getgrnam(TLOG_LOG_FILE_GROUP).gr_gid
+            os.chown(self._log_file, uid, gid)
+            os.chmod(self._log_file, TLOG_LOG_FILE_MODE)
         self._ensure_append_only()
 
     def _ensure_append_only(self) -> None:
@@ -197,7 +200,8 @@ class TlogService:
 
         Raises:
             TlogServiceError: wrapper validation failed (no snippet written).
-            TlogServiceReloadError: sshd -t or reload failed (snippet reverted).
+            TlogServiceReloadError: sshd -t or reload failed (previous snippet
+                state restored).
 
         """
         if not groups:
@@ -212,14 +216,45 @@ class TlogService:
         self._write_tlog_conf()
         self._write_wrapper_atomic()
         self._write_logrotate()
+        self._ensure_audit_rules()
         self._write_sshd_snippet(groups)
 
     def _disable(self) -> None:
-        """Remove the sshd snippet and reload only if it existed (H3 idempotent)."""
-        if not self._snippet_path.exists():
-            return
-        self._snippet_path.unlink()
-        self.reload_sshd()
+        """Remove the sshd snippet and tamper rules; reload only what existed."""
+        if self._snippet_path.exists():
+            self._snippet_path.unlink()
+            self.reload_sshd()
+        if self._audit_rules_path.exists():
+            self._audit_rules_path.unlink()
+            self._reload_audit_rules()
+
+    def _ensure_audit_rules(self) -> None:
+        """Install the tamper-detection audit rules and load them if changed."""
+        content = read_file(self._audit_rules_source)
+        current = (
+            self._audit_rules_path.read_text(encoding="utf-8")
+            if self._audit_rules_path.exists()
+            else ""
+        )
+        if content != current:
+            write_file(self._audit_rules_path, content, "root", 0o640)
+            self._reload_audit_rules()
+
+    def _reload_audit_rules(self) -> None:
+        """Reload the merged audit rules.
+
+        A failure is logged, not raised, so recording still works without the
+        tamper-detection rules, and the rules retry on the next reconcile that
+        changes them.
+        """
+        result = subprocess.run(
+            ["augenrules", "--load"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            logger.warning("Failed to load audit rules: %s", result.stderr.strip())
 
     def _write_tlog_conf(self) -> None:
         """Write tlog-rec-session.conf if content changed."""
@@ -275,10 +310,16 @@ class TlogService:
             write_file(self._logrotate_path, _TLOG_LOGROTATE_CONTENT, "root", 0o644)
 
     def _write_sshd_snippet(self, groups: str) -> None:
-        """Write sshd drop-in, run sshd -t, reload. Reverts snippet on sshd -t failure (C5).
+        """Write the sshd drop-in, validate with sshd -t, then reload sshd.
+
+        On validation or reload failure the previous snippet (or its absence)
+        is restored, so the on-disk state stays last-known-good and the next
+        reconcile sees a content difference and retries the full
+        write/validate/reload sequence.
 
         Raises:
-            TlogServiceReloadError: sshd -t failed (snippet reverted) or reload failed.
+            TlogServiceReloadError: sshd -t or reload failed (previous snippet
+                state restored).
 
         """
         new_snippet = render_jinja2_template(
@@ -294,14 +335,21 @@ class TlogService:
 
         self._snippet_path.parent.mkdir(parents=True, exist_ok=True)
         write_file(self._snippet_path, new_snippet, "root", 0o644)
-        self.validate_sshd()
-        self.reload_sshd()
+        try:
+            self.validate_sshd()
+            self.reload_sshd()
+        except TlogServiceReloadError:
+            if current:
+                write_file(self._snippet_path, current, "root", 0o644)
+            else:
+                self._snippet_path.unlink(missing_ok=True)
+            raise
 
     def validate_sshd(self) -> None:
-        """Run sshd -t; revert snippet and raise on failure (C5).
+        """Run sshd -t and raise if the sshd configuration is invalid.
 
         Raises:
-            TlogServiceReloadError: sshd config is invalid (snippet removed).
+            TlogServiceReloadError: sshd config is invalid.
 
         """
         result = subprocess.run(
@@ -312,11 +360,7 @@ class TlogService:
         )
         if result.returncode != 0:
             logger.error("sshd -t failed: %s", result.stderr.strip())
-            self._snippet_path.unlink(missing_ok=True)
-            raise TlogServiceReloadError(
-                f"sshd config invalid after writing snippet; reverted. "
-                f"sshd -t output: {result.stderr.strip()}"
-            )
+            raise TlogServiceReloadError(f"sshd config validation failed: {result.stderr.strip()}")
 
     def reload_sshd(self) -> None:
         """Reload sshd without dropping live sessions.

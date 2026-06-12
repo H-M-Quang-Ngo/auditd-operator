@@ -56,3 +56,65 @@ def test_get_machine_virt_type_bare_metal(mock_run):
 def test_get_machine_virt_type_failure(_):
     with pytest.raises(CalledProcessError):
         utils.get_machine_virt_type()
+
+
+@patch("utils.os.chmod")
+@patch("utils.os.chown")
+@patch("utils.grp.getgrnam")
+@patch("utils.pwd.getpwnam")
+def test_write_file_with_group(mock_pw, mock_gr, mock_chown, mock_chmod, tmp_path):
+    mock_pw.return_value = MagicMock(pw_uid=1001)
+    mock_gr.return_value = MagicMock(gr_gid=1002)
+    path = tmp_path / "file.txt"
+    utils.write_file_with_group(path, "content", "tlog", "adm", 0o640)
+    assert path.exists()
+    assert path.read_text(encoding="utf-8") == "content"
+    mock_chmod.assert_called_once()
+    mock_chown.assert_called_once()
+
+
+@patch("utils.os.chmod")
+@patch("utils.os.chown")
+@patch("utils.grp.getgrnam")
+@patch("utils.pwd.getpwnam")
+def test_write_file_with_group_cleans_up_on_failure(
+    mock_pw, mock_gr, mock_chown, mock_chmod, tmp_path
+):
+    mock_pw.return_value = MagicMock(pw_uid=1001)
+    mock_gr.return_value = MagicMock(gr_gid=1002)
+    mock_chown.side_effect = PermissionError("no permission")
+    path = tmp_path / "file.txt"
+    with pytest.raises(PermissionError):
+        utils.write_file_with_group(path, "content", "tlog", "adm", 0o640)
+    assert not path.exists()
+
+
+@patch("utils.os.unlink", side_effect=OSError("cannot unlink"))
+@patch("utils.os.chmod")
+@patch("utils.os.chown")
+@patch("utils.grp.getgrnam")
+@patch("utils.pwd.getpwnam")
+def test_write_file_with_group_unlink_failure_suppressed(
+    mock_pw, mock_gr, mock_chown, mock_chmod, mock_unlink, tmp_path
+):
+    """OSError during temp-file cleanup is suppressed; original error re-raised."""
+    mock_pw.return_value = MagicMock(pw_uid=1001)
+    mock_gr.return_value = MagicMock(gr_gid=1002)
+    mock_chown.side_effect = PermissionError("no permission")
+    path = tmp_path / "file.txt"
+    with pytest.raises(PermissionError):
+        utils.write_file_with_group(path, "content", "tlog", "adm", 0o640)
+
+
+@patch("utils.os.chmod")
+@patch("utils.os.chown")
+@patch("utils.grp.getgrnam")
+@patch("utils.pwd.getpwnam")
+def test_make_dir(mock_pw, mock_gr, mock_chown, mock_chmod, tmp_path):
+    mock_pw.return_value = MagicMock(pw_uid=1001)
+    mock_gr.return_value = MagicMock(gr_gid=1002)
+    target = tmp_path / "subdir"
+    utils.make_dir(target, "tlog", "tlog", 0o2750)
+    assert target.exists()
+    mock_chown.assert_called_once_with(target, uid=1001, gid=1002)
+    mock_chmod.assert_called_once_with(target, 0o2750)

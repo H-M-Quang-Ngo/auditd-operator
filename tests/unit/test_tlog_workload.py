@@ -388,14 +388,12 @@ def test_ensure_log_dir_creates_file_when_absent(
 @patch("tlog_workload.write_file_with_group")
 @patch("tlog_workload.make_dir")
 def test_ensure_log_dir_heals_existing_file_without_rewrite(
-    mock_make_dir, mock_write, mock_attr, mock_pwd, mock_grp, mock_chown, mock_chmod, svc, tmp_path
+    mock_make_dir, mock_write, mock_attr, mock_pwd, mock_grp, mock_chown, mock_chmod, svc
 ):
-    """An existing file gets ownership/mode healed but its content is never touched."""
-    log_dir = tmp_path / "tlog"
-    log_dir.mkdir()
-    log_file = log_dir / "sessions.log"
-    log_file.write_text("existing recording data")
-    svc._log_dir = log_dir
+    """A drifted existing file gets ownership/mode healed but its content is never touched."""
+    log_file = MagicMock()
+    log_file.exists.return_value = True
+    log_file.stat.return_value = MagicMock(st_uid=0, st_gid=0, st_mode=0o100600)
     svc._log_file = log_file
     svc.ensure_log_dir()
     mock_write.assert_not_called()
@@ -403,7 +401,44 @@ def test_ensure_log_dir_heals_existing_file_without_rewrite(
     mock_grp.assert_called_once_with("adm")
     mock_chown.assert_called_once_with(log_file, 999, 4)
     mock_chmod.assert_called_once_with(log_file, 0o640)
-    assert log_file.read_text() == "existing recording data"
+    mock_attr.assert_called_once()
+
+
+@patch("tlog_workload.os.chmod")
+@patch("tlog_workload.os.chown")
+@patch("tlog_workload.grp.getgrnam", return_value=MagicMock(gr_gid=4))
+@patch("tlog_workload.pwd.getpwnam", return_value=MagicMock(pw_uid=999))
+@patch.object(TlogService, "_ensure_append_only")
+@patch("tlog_workload.make_dir")
+def test_ensure_log_dir_skips_reenforce_when_ownership_clean(
+    mock_make_dir, mock_attr, mock_pwd, mock_grp, mock_chown, mock_chmod, svc
+):
+    log_file = MagicMock()
+    log_file.exists.return_value = True
+    log_file.stat.return_value = MagicMock(st_uid=999, st_gid=4, st_mode=0o100640)
+    svc._log_file = log_file
+    svc.ensure_log_dir()
+    mock_chown.assert_not_called()
+    mock_chmod.assert_not_called()
+    mock_attr.assert_called_once()
+
+
+@patch("tlog_workload.os.chmod")
+@patch("tlog_workload.os.chown", side_effect=PermissionError("Operation not permitted"))
+@patch("tlog_workload.grp.getgrnam", return_value=MagicMock(gr_gid=4))
+@patch("tlog_workload.pwd.getpwnam", return_value=MagicMock(pw_uid=999))
+@patch.object(TlogService, "_ensure_append_only")
+@patch("tlog_workload.make_dir")
+def test_ensure_log_dir_warns_when_reenforce_blocked(
+    mock_make_dir, mock_attr, mock_pwd, mock_grp, mock_chown, mock_chmod, svc
+):
+    """An unhealable drift (blocked by append-only) is logged, not raised."""
+    log_file = MagicMock()
+    log_file.exists.return_value = True
+    log_file.stat.return_value = MagicMock(st_uid=0, st_gid=0, st_mode=0o100600)
+    svc._log_file = log_file
+    svc.ensure_log_dir()  # no exception
+    mock_chown.assert_called_once()
     mock_attr.assert_called_once()
 
 

@@ -7,6 +7,7 @@ import grp
 import logging
 import os
 import pwd
+import stat
 import subprocess
 from pathlib import Path
 
@@ -118,8 +119,9 @@ class TlogService:
     def ensure_log_dir(self) -> None:
         """Ensure /var/log/tlog/ and the log file exist with privileged ownership.
 
-        Ownership/permissions are re-enforced on every reconcile so a drifted
-        file is healed and recording does not fail with EACCES.
+        On an existing file, ownership/mode are re-applied only when they have drifted.
+        Failure to re-apply is due to the expected append-only attribute of the log file,
+        so it is logged as a warning but not raised.
 
         """
         make_dir(self._log_dir, TLOG_LOG_DIR_OWNER, TLOG_LOG_DIR_GROUP, TLOG_LOG_DIR_MODE)
@@ -128,11 +130,30 @@ class TlogService:
                 self._log_file, "", TLOG_LOG_FILE_OWNER, TLOG_LOG_FILE_GROUP, TLOG_LOG_FILE_MODE
             )
         else:
-            uid = pwd.getpwnam(TLOG_LOG_FILE_OWNER).pw_uid
-            gid = grp.getgrnam(TLOG_LOG_FILE_GROUP).gr_gid
-            os.chown(self._log_file, uid, gid)
-            os.chmod(self._log_file, TLOG_LOG_FILE_MODE)
+            self._reenforce_log_file_ownership()
         self._ensure_append_only()
+
+    def _reenforce_log_file_ownership(self) -> None:
+        """Try to re-apply log-file ownership/mode only when it has drifted."""
+        uid = pwd.getpwnam(TLOG_LOG_FILE_OWNER).pw_uid
+        gid = grp.getgrnam(TLOG_LOG_FILE_GROUP).gr_gid
+        info = self._log_file.stat()
+        needs_chown = info.st_uid != uid or info.st_gid != gid
+        needs_chmod = stat.S_IMODE(info.st_mode) != TLOG_LOG_FILE_MODE
+        if not (needs_chown or needs_chmod):
+            return
+        try:
+            if needs_chown:
+                os.chown(self._log_file, uid, gid)
+            if needs_chmod:
+                os.chmod(self._log_file, TLOG_LOG_FILE_MODE)
+        except OSError as exc:
+            logger.warning(
+                "Could not re-enforce ownership/mode on %s (recording continues; "
+                "auditd watch still detects tampering): %s",
+                self._log_file,
+                exc,
+            )
 
     def _ensure_append_only(self) -> None:
         """Set append-only (chattr +a) on sessions.log as tamper hardening.

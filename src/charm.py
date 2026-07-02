@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2025 Canoincal Ltd.
+# Copyright 2025 Canonical Ltd.
 # See LICENSE file for licensing details.
 
 """The entrypoint for auditd operator."""
@@ -11,6 +11,7 @@ import ops
 import pydantic
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 
+from tlog_workload import TlogService, TlogServiceError, TlogServiceReloadError
 from utils import get_machine_virt_type, read_file
 from workloads import AuditdConfig, AuditdService, AuditdServiceRestartError
 
@@ -34,6 +35,7 @@ class AuditdOperatorCharm(ops.CharmBase):
         super().__init__(*args)
 
         self.auditd = AuditdService()
+        self.tlog = TlogService()
 
         # Forward auditd logs
         self.cos_agent_provider = COSAgentProvider(
@@ -50,10 +52,11 @@ class AuditdOperatorCharm(ops.CharmBase):
     def _on_remove(self, _: ops.RemoveEvent) -> None:
         """Handle remove charm event."""
         if not self._is_valid_platform():
-            logger.warning("Not removing package: auditd cannot be run on a linux container.")
+            logger.warning("Not removing packages: cannot run on a linux container.")
             return
 
-        self.unit.status = ops.MaintenanceStatus("Removing auditd package.")
+        self.unit.status = ops.MaintenanceStatus("Removing packages.")
+        self.tlog.remove()
         self.auditd.remove()
 
     def _on_install_or_upgrade(self, _: tuple[ops.InstallEvent | ops.UpgradeCharmEvent]) -> None:
@@ -67,15 +70,23 @@ class AuditdOperatorCharm(ops.CharmBase):
 
     def _configure_charm(self, _: ops.HookEvent) -> None:
         """Configure the charm idempotently."""
+        if not self._is_valid_platform():
+            self.unit.status = ops.BlockedStatus("Platform not supported (LXC).")
+            return
+
         if not (config := self._get_validated_config()):
             self.unit.status = ops.BlockedStatus("Invalid config. Please check `juju debug-log`.")
             return
 
-        if not self._configure_auditd(config):
-            self.unit.status = ops.BlockedStatus("Failed to configure and restart auditd.")
-            return
+        ok_auditd = self._configure_auditd(config)
+        ok_tlog = self._configure_tlog(config)
 
-        self.unit.status = ops.ActiveStatus()
+        if not ok_auditd:
+            self.unit.status = ops.BlockedStatus("Failed to configure and restart auditd.")
+        elif not ok_tlog:
+            self.unit.status = ops.BlockedStatus("Failed to configure tlog recording.")
+        else:
+            self.unit.status = ops.ActiveStatus()
 
     def _is_valid_platform(self) -> bool:
         """Check if the charm is supported in the current platform.
@@ -135,6 +146,26 @@ class AuditdOperatorCharm(ops.CharmBase):
             else:
                 logger.info("Auditd restart successfully.")
 
+        self.auditd.ensure_audit_rules()
+        return True
+
+    def _configure_tlog(self, config: dict) -> bool:
+        """Configure tlog session recording.
+
+        Args:
+            config (dict): The validated charm config.
+
+        Returns:
+            True if tlog recording configured successfully, otherwise False.
+
+        """
+        enabled = config.get("enable_session_recording", False)
+        exclude_groups = config.get("session_recording_exclude_groups", "")
+        try:
+            self.tlog.configure(enabled=enabled, exclude_groups=exclude_groups)
+        except (TlogServiceError, TlogServiceReloadError) as e:
+            logger.error("Failed to configure tlog recording: %s", str(e))
+            return False
         return True
 
 

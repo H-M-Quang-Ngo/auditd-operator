@@ -3,6 +3,7 @@
 """The auditd service module."""
 
 import logging
+import re
 import subprocess
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from constants import (
     AUDITD_CONFIG_TEMPLATE,
     AUDITD_MAX_NUM_LOGS,
     AUDITD_MIN_NUM_LOGS,
+    GROUP_NAME_PATTERN,
     TEMPLATE_FILE_PATH,
 )
 from utils import read_file, render_jinja2_template, write_file
@@ -39,6 +41,8 @@ class AuditdConfig(pydantic.BaseModel):
 
     num_logs: int = pydantic.Field(10)
     max_log_file: int = pydantic.Field(512)
+    enable_session_recording: bool = pydantic.Field(True)
+    session_recording_exclude_groups: str = pydantic.Field("")
 
     @pydantic.field_validator("num_logs")
     @classmethod
@@ -49,6 +53,23 @@ class AuditdConfig(pydantic.BaseModel):
         if value > AUDITD_MAX_NUM_LOGS:
             raise ValueError(f"'num_logs' cannot be larger than {AUDITD_MAX_NUM_LOGS}.")
         return value
+
+    @pydantic.field_validator("session_recording_exclude_groups")
+    @classmethod
+    def validate_session_recording_exclude_groups(cls, value: str) -> str:
+        """Validate 'session_recording_exclude_groups' charm config option.
+
+        Returns a cleaned comma-joined string of group names to exempt from recording.
+        Empty string means exclude nobody (record everyone).
+        """
+        if not value:
+            return ""
+        tokens = [t.strip() for t in value.split(",")]
+        tokens = [t for t in tokens if t]
+        for token in tokens:
+            if not re.match(GROUP_NAME_PATTERN, token):
+                raise ValueError(f"Invalid group name {token!r}: must match {GROUP_NAME_PATTERN}")
+        return ",".join(tokens)
 
 
 class AuditdService:
@@ -124,6 +145,26 @@ class AuditdService:
 
         """
         return systemd.service_running(self.name)
+
+    def ensure_audit_rules(self) -> None:
+        """Write rule files and reload if any changed.
+
+        Idempotent: rules already matching what is in AUDIT_RULE_PATH produce no reload.
+        Called from the configure path so new rules load on a running unit, not only at
+        install/upgrade.
+
+        """
+        changed = False
+        for rule_file in Path(AUDIT_RULE_PATH).glob("*"):
+            content = read_file(rule_file)
+            destination = self.rule_path / rule_file.name
+            current = destination.read_text(encoding="utf-8") if destination.exists() else ""
+            if content != current:
+                logger.info("Writing updated audit rule to '%s'", destination)
+                write_file(destination, content, "root", 0o640)
+                changed = True
+        if changed:
+            self._merge_audit_rules()
 
     def _add_audit_rules(self, path: str) -> None:
         """Add audit rule files.

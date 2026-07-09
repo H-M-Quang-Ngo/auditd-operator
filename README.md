@@ -55,8 +55,9 @@ juju config auditd enable_session_recording=false
   and data-retention policies so that tlog records are accessible only to authorised operators
   and are retained no longer than required.
 - **File transfers are not recorded.** `scp`, `rsync`, and sftp sessions are passed through
-  unrecorded (the tlog pty layer would corrupt binary framing). They are still covered by auditd
-  path-watch rules.
+  unrecorded (the tlog pty layer would corrupt binary framing). To cover this blind spot, auditd
+  execve-watches the transfer binaries (`sftp-server`, `scp`, `rsync`) under the `file_transfer`
+  key. This catches both inbound transfers and a logged-in user pushing data off the box.
 - **Weaker guarantees on containers (LXC).** In session-recording-only mode there is no [no auditd
   tamper detection](#tamper-detection-&-alerting) for the recording assets.
   Session recording is a best-effort trail.
@@ -74,7 +75,9 @@ auditd watches these session-recording assets:
 - setuid recorder binary
 - logrotate config,
 - the audit rules themselves
-and records all writes/attribute changes.
+and records all writes/attribute changes. It also execve-watches the file-transfer binaries
+(`sftp-server`, `scp`, `rsync`, key `file_transfer`) to cover the transfer recording blind spot
+described above.
 
 [Loki alert rules](src/loki_alert_rules/audit.yaml) turn the audit logs into pages, but the alerts
 are paging only on **interactive** tampering, which is distinguished by the audit `auid` (login uid).

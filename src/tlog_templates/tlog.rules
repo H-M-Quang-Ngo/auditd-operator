@@ -47,3 +47,10 @@
 # Filtering on auid leaves only sshd launched from a logged-in session -- the
 # second-sshd recording bypass this rule exists to catch.
 -a always,exit -F path=/usr/sbin/sshd -F perm=x -F auid!=unset -k sshd_execve
+
+# File-transfer sessions (scp/rsync/sftp) bypass tlog recording: the pty layer
+# corrupts binary protocol framing, so tlog_wrapper passes them through unrecorded.
+# Watch execve of the transfer binaries so file-transfers still leave an audit trail.
+-a always,exit -F path=/usr/lib/openssh/sftp-server -F perm=x -F auid!=unset -k file_transfer
+-a always,exit -F path=/usr/bin/scp -F perm=x -F auid!=unset -k file_transfer
+-a always,exit -F path=/usr/bin/rsync -F perm=x -F auid!=unset -k file_transfer

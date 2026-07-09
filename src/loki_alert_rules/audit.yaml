@@ -127,3 +127,24 @@ groups:
         Check the event with "sudo ausearch -k sshd_execve".
 
           LABELS = {{ $labels }}
+  - alert: FileTransferSessionDetected
+    expr: |
+      count by (instance, auid, exe, juju_model, juju_model_uuid) (
+        count_over_time({filename=~"/var/log/audit/audit\\.log.*"}
+        |~ `type=SYSCALL`
+        |~ `file_transfer`
+        | regexp `auid=(?P<auid>[0-9]+)`
+        | regexp `exe="(?P<exe>[^"]+)"`
+        | auid != `4294967295` [1h])
+      ) > 0
+    labels:
+      severity: warning
+    annotations:
+      summary: file transfer on {{ $labels.instance }}
+      description: |
+        A file-transfer session (scp/rsync/sftp) ran on {{ $labels.instance }}:
+        login uid {{ $labels.auid }} executed {{ $labels.exe }}. This may be legitimate
+        operator activity.
+        Check the event with "sudo ausearch -k file_transfer -i --start today".
+
+          LABELS = {{ $labels }}

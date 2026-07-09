@@ -6,8 +6,8 @@ user_shell=$(getent passwd "$(id -un)" | cut -d: -f7)
 [ -n "$user_shell" ] || user_shell=/bin/sh
 
 # sshd suppresses MOTD/login messages for ForceCommand sessions.
-# PAM still regenerates /run/motd.dynamic during session setup, so re-emit it
-# here for interactive logins.
+# PAM still regenerates /run/motd.dynamic during session setup,
+# so re-emit it here for interactive logins.
 if [ -z "$SSH_ORIGINAL_COMMAND" ] && [ ! -e "$HOME/.hushlogin" ]; then
   [ -s /run/motd.dynamic ] && cat /run/motd.dynamic 2>/dev/null
   [ -s /etc/motd ] && cat /etc/motd 2>/dev/null
@@ -26,7 +26,7 @@ case ",$(id -nG "$(id -un)" | tr ' ' ','), " in
 {% endif %}
 case "$SSH_ORIGINAL_COMMAND" in
   # Binary file-transfer protocols: tlog cannot record them and its pty layer corrupts framing.
-  # Pass through to the user's real shell unrecorded (covered by auditd path-watch rules).
+  # Pass through to the user's real shell unrecorded (execve-watched by auditd).
   "scp -"*|"rsync --server"*|"/usr/lib/openssh/sftp-server"*|"internal-sftp"*)
     exec "$user_shell" -c "$SSH_ORIGINAL_COMMAND"
     ;;
